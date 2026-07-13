@@ -33,13 +33,13 @@ parser.add_argument('--collision_thresh', type=float, default=0.01, help='Collis
 parser.add_argument('--voxel_size', type=float, default=0.01, help='Voxel Size to process point clouds before collision detection [default: 0.01]')
 cfgs = parser.parse_args()
 
-save_dir = "my_zed_data"
+save_dir = "Camera_Captures"
 os.makedirs(save_dir, exist_ok=True)
 
 grabber = zcpp.ZedGrabber(
     views=["LEFT_BGR", "DEPTH_MEASURE"],
     camera_fps=60,
-    enable_tracking=False,  # Tracking not needed since we aren't fusing frames
+    enable_tracking=False,  
     depth_mode="NEURAL"
 )
 
@@ -69,7 +69,7 @@ def get_net():
 def get_and_process_data(data_dir):
 
 
-    print("Showing live preview. Press 'q' to stop or wait for capture...")
+    print("Capturing Depth Frame")
     for i in range(30):
         _, rgb = grabber.get_latest("LEFT_BGR")
         _, depth_raw = grabber.get_latest("DEPTH_MEASURE")
@@ -87,13 +87,10 @@ def get_and_process_data(data_dir):
         # Filter distance thresholds
         cropped_depth[(cropped_depth < MIN_DEPTH_M) | (cropped_depth > MAX_DEPTH_M)] = 0.0
 
-        # --- LIVE VISUALIZATION ---
-        # Normalize depth map to 0-255 so OpenCV can render it cleanly
         depth_visual = cv2.normalize(cropped_depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         depth_colored = cv2.applyColorMap(depth_visual, cv2.COLORMAP_JET)
         
         cv2.imshow("ZED Cropped Depth (Filtered)", depth_colored)
-        #cv2.imshow("ZED Live RGB", rgb[:, :, :3])
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -108,15 +105,13 @@ def get_and_process_data(data_dir):
     # Write outputs to disk
     cv2.imwrite(os.path.join(save_dir, "color.png"), color_img)
     cv2.imwrite(os.path.join(save_dir, "depth.png"), depth_uint16)
-    print(f"\nSaved GraspNet frame data to: '{save_dir}/'")
 
-    # 5. Create and save the workspace mask
     mask = np.ones(color_img.shape[:2], dtype=np.uint8) * 255
     cv2.imwrite(os.path.join(save_dir, "workspace_mask.png"), mask)
-    print("Saved workspace_mask.png!")
 
-    # --- 6. ADDED: POINT CLOUD GENERATION & FILTERING ---
-    print("\nGenerating 3D Point Cloud...")
+    print(f"[Grasp Server] Saved color, depth, and workspace mask to {save_dir}")
+
+    
     height, width = color_img.shape[:2]
 
     # Convert BGR to RGB because Open3D expects standard RGB ordering
@@ -126,34 +121,20 @@ def get_and_process_data(data_dir):
     o3d_color = o3d.geometry.Image(rgb_rgb)
     o3d_depth = o3d.geometry.Image(cropped_depth.astype(np.float32))
 
-    # Construct an RGBD Image 
-    rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        o3d_color, 
-        o3d_depth, 
-        depth_scale=1.0,           # Keep it at 1.0 since data is already in meters
-        depth_trunc=MAX_DEPTH_M,   # Clip any accidental values beyond our threshold
-        convert_rgb_to_intensity=False
-    )
+
+    color = rgb_rgb.astype(np.float32) / 255.0
+    depth = depth_uint16.astype(np.float32)
+    workspace_mask = mask.astype(np.uint8)
     intr_dict = grabber.get_intrinsics()
 
-    # load data
-    color = np.array(Image.open(os.path.join(data_dir, 'color.png')), dtype=np.float32) / 255.0
-    depth = np.array(Image.open(os.path.join(data_dir, 'depth.png')))
-    workspace_mask = np.array(Image.open(os.path.join(data_dir, 'workspace_mask.png')))
-    #meta = scio.loadmat(os.path.join(data_dir, 'meta.mat'))
-    #intrinsic = meta['intrinsic_matrix']
-    #factor_depth = meta['factor_depth']
 
-    # generate cloud
-
-    # HARDCODE YOUR ZED INTRINSICS DIRECTLY:
     fx = intr_dict['fx']
     fy = intr_dict['fy']
     cx = intr_dict['cx']
     cy = intr_dict['cy']
+
     factor_depth = 1000.0  # Tells GraspNet that 1000 pixels = 1 meter
 
-    #camera = CameraInfo(1280.0, 720.0, intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2], factor_depth)
     camera = CameraInfo(1280.0, 720.0, fx,fy,cx,cy, factor_depth)
     cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
 
@@ -170,34 +151,8 @@ def get_and_process_data(data_dir):
         std_ratio=1
     )
     
-    # Filter arrays using generated inlier index mask
     cloud_masked = cloud_masked[inlier_indices]
     color_masked = color_masked[inlier_indices]
-
-    pcd_for_ransac = o3d.geometry.PointCloud()
-    pcd_for_ransac.points = o3d.utility.Vector3dVector(cloud_masked.astype(np.float64))
-    
-    plane_model, inliers = pcd_for_ransac.segment_plane(
-        distance_threshold=0.010,  # 10mm table threshold
-        ransac_n=3,
-        num_iterations=200
-    )
-    
-    # Generate a boolean mask where True means "NOT part of the table plane"
-    #non_table_mask = np.ones(len(cloud_masked), dtype=bool)
-    #non_table_mask[inliers] = False
-    
-    # Strip the table entirely out of the tracking arrays
-    #cloud_masked = cloud_masked[non_table_mask]
-    #color_masked = color_masked[non_table_mask]
-
-    # 3. NEW: Quick Secondary Clean to remove tiny floating artifacts left near table-cut boundaries
-    pcd_clean = o3d.geometry.PointCloud()
-    pcd_clean.points = o3d.utility.Vector3dVector(cloud_masked.astype(np.float64))
-    _, post_inliers = pcd_clean.remove_statistical_outlier(nb_neighbors=15, std_ratio=1.5)
-    
-    #cloud_masked = cloud_masked[post_inliers]
-    #color_masked = color_masked[post_inliers]
 
     # sample points
     if len(cloud_masked) >= cfgs.num_point:
@@ -264,21 +219,16 @@ def handle_incoming_request(request):
         return response
     
     if (request.req == bridge_pb2.CLOUD and have_cached_cloud):
-        # 1. Extract raw NumPy arrays out of the Open3D cloud object safely
         response.resp = bridge_pb2.OK
         np_points = np.asarray(cached_cloud.points)
         np_colors = np.asarray(cached_cloud.colors)
 
-        # 2. Initialize the PointCloud sub-message inside the oneof payload
         pc_msg = response.point_cloud
-        pc_msg.num_points = len(np_points) # len() works perfectly on numpy arrays now!
+        pc_msg.num_points = len(np_points)
 
-        # 3. Flatten the distinct (N, 3) arrays into flat 1D lists
-        # FIXED: Points use np_points, Colors use np_colors
         flat_points = np_points.flatten().astype(float).tolist()
         flat_colors = np_colors.flatten().astype(float).tolist()
 
-        # 4. Push the continuous blocks straight onto the Protobuf message wire
         pc_msg.points.extend(flat_points)
         pc_msg.colors.extend(flat_colors)
 
@@ -298,13 +248,13 @@ def handle_incoming_request(request):
         gg.sort_by_score()
         
         if len(gg) == 0:
-            print("[ZBridge Server] 0 valid grasps found.")
+            print("[Grasp Server] 0 valid grasps found.")
             response.resp = bridge_pb2.ERROR 
             return response
-            
+
+        vis_grasps(gg, cloud) 
         response.resp = bridge_pb2.OK
     
-
         grasp_list_msg = response.grasp_list 
 
         for i in range(min(15, len(gg))):
@@ -326,10 +276,10 @@ def handle_incoming_request(request):
             
             grasp_msg.count = i + 1
             
-        print(f"[ZBridge Server] Successfully populated {len(grasp_list_msg.items)} grasps inside payload.")
+        print(f"[Grasp Server] Successfully populated {len(grasp_list_msg.items)} grasps inside payload.")
 
     except Exception as e:
-        print(f"[ZBridge Server] Critical Error: {e}")
+        print(f"[Grasp Server] Critical Error: {e}")
         response.resp = bridge_pb2.ERROR
 
     return response
@@ -339,7 +289,7 @@ def demo():
     server.start(handle_incoming_request)
     grabber.start()
     time.sleep(0.5)
-    print("Started server ask for grasps")
+    print("Grasp Server is Online. Ready for Requests.")
     server.join()
      
 if __name__=='__main__':
